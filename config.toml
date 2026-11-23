@@ -1,0 +1,66 @@
+# The display name of the AIO instance.
+first.display = "First"
+
+# This file is where the daemon stores the logged data.
+#
+# Note that the daemon will perform very intensive I/O, so it is recommended
+# to keep this path unchanged to minimise SSD wear. If you use an HDD or
+# do not mind wearing out your SSD, you can place this file elsewhere so
+# the log is preserved across reboots.
+first.logfile = "/tmp/aio_first.json"
+
+# This is the base time. All timestamps in the JSON file are represented
+# as minutes since this base time. Change this base time only before you
+# start the daemon. Once the daemon has started, do not change this value,
+# as doing so will invalidate existing timestamps.
+#
+# By default it is set to 1 January 2026 00:00:00 UTC. Set this time
+# in ISO 8601 format.
+first.basetime = "2026-01-01T00:00:00Z"
+
+# This sets the maximum size of the JSON file (in bytes). By default it is
+# 10000000 (10 MB), which is sufficient to store more than one year's worth
+# of data in typical use. If you store the data on your SSD, you may choose
+# a smaller limit to retain less history and reduce daily SSD writes.
+first.sizelimit = 10000000
+
+# This sets the URL that the daemon uses to check connectivity. By default it
+# is set to KDE's network connectivity check service. If you don't care about
+# privacy from big-techs please change it to the one offered by Cloudflare,
+# Apple or Microsoft to save the limited resources from the free software
+# community.
+first.testsite = "https://networkcheck.kde.org/"
+# first.testsite = "http://cp.cloudflare.com/generate_204"
+# first.testsite = "http://captive.apple.com/hotspot-detect.html"
+# first.testsite = "http://www.msftconnecttest.com/connecttest.txt"
+
+# Supported proxy types: socks5, socks4, http.
+# first.proxy.host = "127.0.0.1"
+# first.proxy.port = 1080
+# first.proxy.type = "socks5"
+
+# You can use SOCKS credentials here.
+# first.proxy.username = "fixeduser"
+# first.proxy.password = "fixedpass"
+
+# You can use SOCKS random credentials here. When use random credentials,
+# AIO will use random credentials every time when connecting to the server.
+# first.proxy.random_auth = true
+# first.proxy.random_auth_length = 20
+
+# You can define as many concurrent AIO instances as you would like.
+#
+# And you can replace `second` or/and `first` with any string that contains
+# only A-Z, a-z and 0-9.
+# second.display = "Second"
+# second.logfile = "/tmp/aio_second.json"
+# second.basetime = "2026-01-01T00:00:00Z"
+# second.sizelimit = 10000000
+# second.testsite = "https://networkcheck.kde.org/"
+# second.proxy.host = "127.0.0.1"
+# second.proxy.port = 1080
+# second.proxy.type = "socks5"
+# second.proxy.username = "fixeduser"
+# second.proxy.password = "fixedpass"
+# second.proxy.random_auth = true
+# second.proxy.random_auth_length = 20
