@@ -1,0 +1,552 @@
+#!/usr/bin/env python3
+"""AIO: multi-instance network connectivity checker."""
+
+import json
+import logging
+import os
+import re
+import secrets
+import ssl
+import string
+import tempfile
+import threading
+from contextlib import closing
+from datetime import datetime, timezone
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
+
+try:
+    import tomllib  # Python 3.11+
+except ModuleNotFoundError:  # Python 3.10 and earlier
+    import tomli as tomllib
+
+try:
+    import socks  # PySocks; only required by instances with [proxy] settings
+except ImportError:
+    socks = None
+
+
+CONFIG_FILE = "config.toml"
+POLL_INTERVAL = 10.0
+REQUEST_TIMEOUT = 5.0
+RANDOM_AUTH_ALPHABET = string.digits + string.ascii_lowercase
+INSTANCE_NAME_RE = re.compile(r"^[A-Za-z0-9]+$")
+
+
+class AIOInstance:
+    """Configuration and network behaviour for one independent AIO instance."""
+
+    def __init__(self, instance_id, values):
+        self.instance_id = instance_id
+
+        allowed_keys = {
+            "display", "logfile", "basetime", "sizelimit", "testsite", "proxy"
+        }
+        unknown_keys = set(values) - allowed_keys
+        if unknown_keys:
+            raise ValueError(
+                f"Instance '{instance_id}' has unknown setting(s): "
+                f"{', '.join(sorted(unknown_keys))}"
+            )
+
+        self.display = values.get("display", instance_id)
+        if not isinstance(self.display, str) or not self.display.strip():
+            raise ValueError(f"Instance '{instance_id}': display must be a non-empty string")
+
+        logfile = values.get("logfile")
+        if not isinstance(logfile, str) or not logfile.strip():
+            raise ValueError(f"Instance '{instance_id}': logfile must be a non-empty string")
+        self.logfile = os.path.abspath(os.path.expanduser(logfile))
+
+        basetime_value = values.get("basetime")
+        if not isinstance(basetime_value, str):
+            raise ValueError(f"Instance '{instance_id}': basetime must be an ISO 8601 string")
+        try:
+            # Accept the common ISO 8601 UTC suffix even on Python versions
+            # whose fromisoformat() does not recognise a trailing 'Z'.
+            parsed_basetime = datetime.fromisoformat(
+                basetime_value[:-1] + "+00:00" if basetime_value.endswith("Z") else basetime_value
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"Instance '{instance_id}': invalid basetime {basetime_value!r}"
+            ) from exc
+        if parsed_basetime.tzinfo is None or parsed_basetime.utcoffset() is None:
+            raise ValueError(
+                f"Instance '{instance_id}': basetime must include a timezone, e.g. 'Z'"
+            )
+        self.basetime = parsed_basetime.astimezone(timezone.utc)
+
+        self.sizelimit = values.get("sizelimit", 10_000_000)
+        if isinstance(self.sizelimit, bool) or not isinstance(self.sizelimit, int):
+            raise ValueError(f"Instance '{instance_id}': sizelimit must be an integer")
+        if self.sizelimit < 64:
+            raise ValueError(
+                f"Instance '{instance_id}': sizelimit must be at least 64 bytes "
+                "so that one timestamped result can be stored"
+            )
+
+        self.testsite = values.get("testsite")
+        if not isinstance(self.testsite, str) or not self.testsite.strip():
+            raise ValueError(f"Instance '{instance_id}': testsite must be a non-empty URL")
+        self.testsite = _normalise_url(self.testsite.strip())
+        parsed_testsite = urlparse(self.testsite)
+        if parsed_testsite.scheme not in ("http", "https") or not parsed_testsite.hostname:
+            raise ValueError(
+                f"Instance '{instance_id}': testsite must be a valid HTTP or HTTPS URL"
+            )
+
+        self.proxy = self._parse_proxy(values.get("proxy"))
+        self.prefix = f"[{self.display} / {self.instance_id}]"
+
+    def _parse_proxy(self, proxy_values):
+        if proxy_values is None:
+            return None
+        if not isinstance(proxy_values, dict):
+            raise ValueError(f"Instance '{self.instance_id}': proxy settings must be a TOML table")
+
+        allowed_keys = {
+            "host", "port", "type", "username", "password",
+            "random_auth", "random_auth_length",
+        }
+        unknown_keys = set(proxy_values) - allowed_keys
+        if unknown_keys:
+            raise ValueError(
+                f"Instance '{self.instance_id}': unknown proxy setting(s): "
+                f"{', '.join(sorted(unknown_keys))}"
+            )
+
+        if socks is None:
+            raise RuntimeError(
+                f"Instance '{self.instance_id}' configures a proxy, but PySocks is not installed."
+            )
+
+        host = proxy_values.get("host")
+        if not isinstance(host, str) or not host.strip():
+            raise ValueError(f"Instance '{self.instance_id}': proxy.host must be a non-empty string")
+
+        port = proxy_values.get("port", 1080)
+        if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+            raise ValueError(f"Instance '{self.instance_id}': proxy.port must be from 1 to 65535")
+
+        proxy_type = str(proxy_values.get("type", "socks5")).lower()
+        if proxy_type not in {"socks5", "socks4", "http"}:
+            raise ValueError(
+                f"Instance '{self.instance_id}': unsupported proxy type {proxy_type!r}; "
+                "choose socks5, socks4, or http"
+            )
+
+        random_auth = proxy_values.get("random_auth", False)
+        if not isinstance(random_auth, bool):
+            raise ValueError(f"Instance '{self.instance_id}': proxy.random_auth must be true or false")
+
+        random_auth_length = proxy_values.get("random_auth_length", 20)
+        if (
+            isinstance(random_auth_length, bool)
+            or not isinstance(random_auth_length, int)
+            or not 1 <= random_auth_length <= 1024
+        ):
+            raise ValueError(
+                f"Instance '{self.instance_id}': proxy.random_auth_length must be from 1 to 1024"
+            )
+
+        username = proxy_values.get("username")
+        password = proxy_values.get("password")
+        if username is not None and not isinstance(username, str):
+            raise ValueError(f"Instance '{self.instance_id}': proxy.username must be a string")
+        if password is not None and not isinstance(password, str):
+            raise ValueError(f"Instance '{self.instance_id}': proxy.password must be a string")
+        if (username is None) != (password is None):
+            raise ValueError(
+                f"Instance '{self.instance_id}': set both proxy.username and proxy.password, or neither"
+            )
+
+        return {
+            "host": host.strip(),
+            "port": port,
+            "type": proxy_type,
+            "username": username,
+            "password": password,
+            "random_auth": random_auth,
+            "random_auth_length": random_auth_length,
+        }
+
+    def fetch_available(self, timeout=REQUEST_TIMEOUT):
+        if self.proxy is not None:
+            return _proxy_fetch_available(self.testsite, self.proxy, timeout)
+        return _direct_fetch_available(self.testsite, timeout)
+
+
+def _normalise_url(url):
+    if not urlparse(url).scheme:
+        return "http://" + url
+    return url
+
+
+def _direct_fetch_available(url, timeout=REQUEST_TIMEOUT):
+    """Check the URL directly, using urllib."""
+    url = _normalise_url(url)
+
+    for method in ("HEAD", "GET"):
+        try:
+            request = Request(url, method=method)
+            with urlopen(request, timeout=timeout) as response:
+                status = getattr(response, "status", None) or response.getcode()
+                return 200 <= status < 400
+        except HTTPError as error:
+            if error.code == 405 and method == "HEAD":
+                continue
+            return 200 <= error.code < 400
+        except (URLError, OSError, ValueError, ssl.SSLError):
+            return False
+
+    return False
+
+
+def _random_token(length):
+    return "".join(secrets.choice(RANDOM_AUTH_ALPHABET) for _ in range(length))
+
+
+def _proxy_credentials(proxy):
+    if proxy["random_auth"]:
+        length = proxy["random_auth_length"]
+        return _random_token(length), _random_token(length)
+    return proxy["username"], proxy["password"]
+
+
+def _build_path(parsed):
+    path = parsed.path or "/"
+    if parsed.params:
+        path += ";" + parsed.params
+    if parsed.query:
+        path += "?" + parsed.query
+    return path
+
+
+def _open_via_socks(parsed, proxy, timeout):
+    host = parsed.hostname
+    if not host:
+        raise ValueError("Invalid URL host")
+
+    host_ascii = host.encode("idna").decode("ascii")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    username, password = _proxy_credentials(proxy)
+
+    proxy_type_map = {
+        "socks5": socks.SOCKS5,
+        "socks4": socks.SOCKS4,
+        "http": socks.HTTP,
+    }
+
+    raw_socket = socks.socksocket()
+    try:
+        raw_socket.set_proxy(
+            proxy_type_map[proxy["type"]],
+            proxy["host"],
+            proxy["port"],
+            rdns=True,
+            username=username,
+            password=password,
+        )
+        raw_socket.settimeout(timeout)
+        raw_socket.connect((host_ascii, port))
+
+        if parsed.scheme == "https":
+            context = ssl.create_default_context()
+            tls_socket = context.wrap_socket(raw_socket, server_hostname=host_ascii)
+            raw_socket = None  # The TLS socket now owns the connection.
+            return tls_socket
+
+        result = raw_socket
+        raw_socket = None
+        return result
+    finally:
+        if raw_socket is not None:
+            raw_socket.close()
+
+
+def _proxy_probe_once(url, method, proxy, timeout=REQUEST_TIMEOUT):
+    url = _normalise_url(url)
+    parsed = urlparse(url)
+
+    if parsed.scheme not in ("http", "https"):
+        return False, None
+
+    host = parsed.hostname
+    if not host:
+        return False, None
+
+    host_ascii = host.encode("idna").decode("ascii")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    path = _build_path(parsed)
+
+    # IPv6 literals must be enclosed in square brackets in the Host header.
+    host_header = f"[{host_ascii}]" if ":" in host_ascii else host_ascii
+    if (parsed.scheme == "http" and port != 80) or (parsed.scheme == "https" and port != 443):
+        host_header = f"{host_header}:{port}"
+
+    request = (
+        f"{method} {path} HTTP/1.1\r\n"
+        f"Host: {host_header}\r\n"
+        f"User-Agent: AIO-connectivity-check/1.0\r\n"
+        f"Accept: */*\r\n"
+        f"Connection: close\r\n"
+        f"\r\n"
+    ).encode("ascii", "strict")
+
+    with closing(_open_via_socks(parsed, proxy, timeout)) as sock:
+        sock.sendall(request)
+        with closing(sock.makefile("rb")) as response_file:
+            status_line = response_file.readline(65536).decode(
+                "iso-8859-1", "replace"
+            ).strip()
+            if not status_line.startswith("HTTP/"):
+                return False, None
+
+            parts = status_line.split(None, 2)
+            if len(parts) < 2:
+                return False, None
+            try:
+                status = int(parts[1])
+            except ValueError:
+                return False, None
+
+            # Consume headers, with a limit in case the peer sends malformed data.
+            header_bytes = 0
+            while True:
+                line = response_file.readline(65536)
+                header_bytes += len(line)
+                if not line or line in (b"\r\n", b"\n"):
+                    break
+                if header_bytes > 65536:
+                    return False, None
+
+            return 200 <= status < 400, status
+
+
+def _proxy_fetch_available(url, proxy, timeout=REQUEST_TIMEOUT):
+    """Check the URL through this instance's configured proxy."""
+    try:
+        ok, status = _proxy_probe_once(url, "HEAD", proxy, timeout)
+        if ok:
+            return True
+        if status == 405:
+            ok, _ = _proxy_probe_once(url, "GET", proxy, timeout)
+            return ok
+        return False
+    except (OSError, ssl.SSLError, ValueError, UnicodeError):
+        return False
+
+
+def _serialise_log(log_data):
+    return json.dumps(log_data, separators=(",", ":"))
+
+
+def _trim_log(log_data, size_limit, must_keep=None):
+    """Trim oldest entries, optionally guaranteeing that one key is retained."""
+    retained = dict(log_data)
+    data = _serialise_log(retained)
+
+    while len(data.encode("utf-8")) > size_limit:
+        removable = [key for key in retained if key != must_keep]
+        if not removable:
+            raise ValueError(
+                f"sizelimit ({size_limit} bytes) is too small to store the new result"
+            )
+        oldest_key = min(removable, key=lambda key: int(key))
+        del retained[oldest_key]
+        data = _serialise_log(retained)
+
+    return retained, data
+
+
+def write_log(log_data, logfile, size_limit, must_keep=None):
+    """Atomically write a size-limited JSON log and return the retained data."""
+    retained, data = _trim_log(log_data, size_limit, must_keep=must_keep)
+    directory = os.path.dirname(logfile) or "."
+    os.makedirs(directory, exist_ok=True)
+
+    fd, temporary_path = tempfile.mkstemp(
+        prefix="." + os.path.basename(logfile) + ".",
+        suffix=".tmp",
+        dir=directory,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as temporary_file:
+            temporary_file.write(data)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        os.replace(temporary_path, logfile)
+    finally:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
+
+    return retained
+
+
+def load_log(instance):
+    """Load an instance's log, creating it when it does not yet exist."""
+    if not os.path.isfile(instance.logfile):
+        logging.info("%s Log file does not exist; creating it", instance.prefix)
+        return write_log({}, instance.logfile, instance.sizelimit)
+
+    with open(instance.logfile, "r", encoding="utf-8") as log_file:
+        log_data = json.load(log_file)
+
+    if not isinstance(log_data, dict):
+        raise ValueError(f"{instance.prefix} Log file must contain a JSON object")
+
+    for key, value in log_data.items():
+        if not isinstance(key, str):
+            raise ValueError(f"{instance.prefix} Log contains a non-string timestamp key")
+        try:
+            int(key)
+        except ValueError as exc:
+            raise ValueError(
+                f"{instance.prefix} Log contains an invalid timestamp key: {key!r}"
+            ) from exc
+        if type(value) is not int or value not in (0, 1):
+            raise ValueError(
+                f"{instance.prefix} Log value for minute {key!r} must be 0 or 1"
+            )
+
+    retained, _serialised = _trim_log(log_data, instance.sizelimit)
+    if retained != log_data or os.path.getsize(instance.logfile) > instance.sizelimit:
+        logging.info("%s Trimming the existing log to its configured size limit", instance.prefix)
+        return write_log(retained, instance.logfile, instance.sizelimit)
+
+    return log_data
+
+
+def load_instances(config_path):
+    with open(config_path, "rb") as config_file:
+        config = tomllib.load(config_file)
+
+    if not config:
+        raise ValueError("The configuration file does not define any AIO instances")
+
+    instances = []
+    used_logfiles = {}
+
+    for instance_id, values in config.items():
+        if not isinstance(instance_id, str) or not INSTANCE_NAME_RE.fullmatch(instance_id):
+            raise ValueError(
+                f"Invalid instance name {instance_id!r}; use only A-Z, a-z, and 0-9"
+            )
+        if not isinstance(values, dict):
+            raise ValueError(
+                f"Top-level setting {instance_id!r} must be an instance table"
+            )
+
+        instance = AIOInstance(instance_id, values)
+        logfile_identity = os.path.realpath(instance.logfile)
+        if logfile_identity in used_logfiles:
+            other_id = used_logfiles[logfile_identity]
+            raise ValueError(
+                f"Instances '{other_id}' and '{instance_id}' use the same log file: "
+                f"{instance.logfile}"
+            )
+        used_logfiles[logfile_identity] = instance_id
+        instances.append(instance)
+
+    return instances
+
+
+def run_instance(instance, initial_log, stop_event):
+    """Run one independent probe loop in its own thread."""
+    log_data = initial_log
+    pending_log = None
+    pending_minute = None
+
+    logging.info(
+        "%s Started; checking %s every minute (poll interval: %s seconds)",
+        instance.prefix,
+        instance.testsite,
+        int(POLL_INTERVAL),
+    )
+
+    while not stop_event.is_set():
+        try:
+            now = datetime.now(timezone.utc)
+            minute = str(int((now - instance.basetime).total_seconds() // 60))
+
+            if minute not in log_data and pending_log is None:
+                logging.info("%s Checking %s", instance.prefix, instance.testsite)
+                available = int(instance.fetch_available())
+                pending_log = dict(log_data)
+                pending_log[minute] = available
+                pending_minute = minute
+                logging.info(
+                    "%s Connectivity check %s",
+                    instance.prefix,
+                    "succeeded" if available else "failed",
+                )
+
+            # Keep the result pending if the disk write fails. This avoids
+            # repeating the network probe every poll interval just because
+            # persisting its result temporarily failed.
+            if pending_log is not None:
+                try:
+                    log_data = write_log(
+                        pending_log,
+                        instance.logfile,
+                        instance.sizelimit,
+                        must_keep=pending_minute,
+                    )
+                    pending_log = None
+                    pending_minute = None
+                except OSError:
+                    logging.exception("%s Could not write the log file", instance.prefix)
+
+        except Exception:
+            logging.exception("%s Unexpected error in the instance worker", instance.prefix)
+
+        stop_event.wait(POLL_INTERVAL)
+
+    logging.info("%s Stopped", instance.prefix)
+
+
+def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    instances = load_instances(CONFIG_FILE)
+
+    # Load/create all files before starting workers. This makes configuration
+    # and log-file errors fail at startup instead of leaving partial operation.
+    instance_logs = {instance.instance_id: load_log(instance) for instance in instances}
+
+    logging.info("Starting %d AIO instance(s)", len(instances))
+    stop_event = threading.Event()
+    threads = []
+
+    for instance in instances:
+        thread = threading.Thread(
+            target=run_instance,
+            args=(instance, instance_logs[instance.instance_id], stop_event),
+            name=f"aio-{instance.instance_id}",
+        )
+        threads.append(thread)
+        thread.start()
+
+    try:
+        for thread in threads:
+            thread.join()
+    except KeyboardInterrupt:
+        logging.info("Shutdown requested; stopping all AIO instances")
+        stop_event.set()
+        for thread in threads:
+            thread.join()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError) as error:
+        logging.basicConfig(level=logging.ERROR, format="%(levelname)s %(message)s")
+        logging.error("AIO could not start: %s", error)
+        raise SystemExit(1)
