@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en-GB">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Am I Online?</title>
+
+  <style>
+    :root {
+      --gap: 1px;
+    }
+
+    html, body {
+      height: 100%;
+      margin: 0;
+    }
+
+    body {
+      background: linear-gradient(180deg, #0a58ca, #0b6be0);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: "Noto Sans", "DejaVu Sans", "Liberation Sans",
+                   "FreeSans", sans-serif;
+    }
+
+    .container {
+      width: min(900px, 90%);
+      padding: 40px;
+      border-radius: 18px;
+      background: transparent;
+      border: 1px solid rgba(255,255,255,0.12);
+      box-shadow: 0 8px 24px rgba(2,6,23,0.45);
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      text-align: center;
+      color: #fff;
+      box-sizing: border-box;
+    }
+
+    h1 {
+      margin: 0 0 10px;
+      font-size: 2.4rem;
+      letter-spacing: 0.4px;
+    }
+
+    p {
+      margin: 0 0 20px;
+      opacity: 0.95;
+      max-width: 70%;
+    }
+
+    /*
+     * One shared three-column grid.
+     * All titles, bars and values share their respective columns.
+     */
+    .bars {
+      width: 100%;
+      display: grid;
+      grid-template-columns: max-content minmax(0, 1fr) max-content;
+      column-gap: 12px;
+      row-gap: 12px;
+      align-items: center;
+    }
+
+    .bar-row {
+      display: contents;
+    }
+
+    .bar-title {
+      text-align: right;
+      white-space: nowrap;
+    }
+
+    .bar-value {
+      text-align: left;
+      white-space: nowrap;
+    }
+
+    .bar {
+      width: 100%;
+      min-width: 0;
+      height: 28px;
+      padding: 4px;
+      box-sizing: border-box;
+      border-radius: 12px;
+      background: rgba(255,255,255,0.03);
+    }
+
+    /*
+     * Exactly 100 columns, regardless of the number of cells.
+     */
+    .bar-inner {
+      width: 100%;
+      height: 100%;
+      display: grid;
+      grid-template-columns: repeat(100, minmax(0, 1fr));
+      gap: var(--gap);
+    }
+
+    .cell {
+      display: block;
+      min-width: 0;
+      height: 100%;
+      box-sizing: border-box;
+      border-radius: 3px;
+    }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 14px;
+      align-items: center;
+    }
+
+    .legend .item {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      font-size: 0.9rem;
+    }
+
+    .swatch {
+      width: 18px;
+      height: 12px;
+      border-radius: 4px;
+    }
+
+    .small-note {
+      margin-top: 10px;
+      font-size: 0.85rem;
+      opacity: 0.85;
+    }
+
+    .form-row {
+      margin-top: 18px;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    input[type="number"] {
+      width: 140px;
+      padding: 8px;
+      border-radius: 8px;
+      border: 1px solid rgba(255,255,255,0.14);
+      background: rgba(255,255,255,0.02);
+      color: #fff;
+    }
+
+    button {
+      padding: 8px 14px;
+      border-radius: 8px;
+      border: 1px solid rgba(255,255,255,0.12);
+      background: rgba(255,255,255,0.04);
+      color: #fff;
+      cursor: pointer;
+    }
+
+    button:active {
+      transform: translateY(1px);
+    }
+
+    @media (max-width: 520px) {
+      .container {
+        width: 94%;
+        padding: 24px 12px;
+      }
+
+      h1 {
+        font-size: 2rem;
+      }
+
+      p {
+        max-width: 100%;
+      }
+
+      .bars {
+        column-gap: 6px;
+        row-gap: 10px;
+      }
+
+      .bar-title,
+      .bar-value {
+        font-size: 0.7rem;
+      }
+
+      .bar {
+        height: 22px;
+        padding: 3px;
+      }
+
+      .form-row {
+        flex-wrap: wrap;
+        justify-content: center;
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <div class="container" role="main">
+
+    <h1>Am I Online?</h1>
+
+    <div class="bars">
+
+    {% for row in bar_rows %}
+        <div class="bar-row">
+
+        <div class="bar-title">{{ row.title }}</div>
+
+        <div class="bar">
+            <div class="bar-inner">
+
+            {% for colour in row.colours %}
+                <i class="cell" style="background: {{ colour }}"></i>
+            {% endfor %}
+
+            </div>
+        </div>
+
+        <div class="bar-value">{{ row.value }}</div>
+
+        </div>
+    {% endfor %}
+
+    </div>
+
+    <div class="legend">
+      <div class="item">
+        <div class="swatch" style="background:#00ff00"></div>
+        Online
+      </div>
+
+      <div class="item">
+        <div class="swatch" style="background:#ff0000"></div>
+        Not Online
+      </div>
+
+      <div class="item">
+        <div class="swatch" style="background:#7f7f7f"></div>
+        No Log
+      </div>
+    </div>
+
+    <form action="" method="get" class="form-row">
+    <label for="count" style="display:none">Count</label>
+
+    <input
+        id="count"
+        name="count"
+        type="number"
+        min="1"
+        step="1"
+        value="{{ count }}"
+        required
+        pattern="^[1-9][0-9]*$"
+        title="Specify the number of minutes"
+        inputmode="numeric"
+    >
+
+    <button type="submit">Confirm</button>
+    </form>
+
+  </div>
+</body>
+</html>
