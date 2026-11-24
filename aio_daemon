@@ -460,7 +460,7 @@ def run_instance(instance, initial_log, stop_event):
     pending_minute = None
 
     logging.info(
-        "%s Started; checking %s every minute (poll interval: %s seconds)",
+        "%s Started; checking %s every minute, retrying failures every %s seconds",
         instance.prefix,
         instance.testsite,
         int(POLL_INTERVAL),
@@ -471,21 +471,25 @@ def run_instance(instance, initial_log, stop_event):
             now = datetime.now(timezone.utc)
             minute = str(int((now - instance.basetime).total_seconds() // 60))
 
-            if minute not in log_data and pending_log is None:
+            # Check if no successful result exists for this minute.
+            # A previous failure (0) does not prevent another attempt.
+            if log_data.get(minute) != 1 and pending_log is None:
                 logging.info("%s Checking %s", instance.prefix, instance.testsite)
+
                 available = int(instance.fetch_available())
+
                 pending_log = dict(log_data)
                 pending_log[minute] = available
                 pending_minute = minute
+
                 logging.info(
                     "%s Connectivity check %s",
                     instance.prefix,
                     "succeeded" if available else "failed",
                 )
 
-            # Keep the result pending if the disk write fails. This avoids
-            # repeating the network probe every poll interval just because
-            # persisting its result temporarily failed.
+            # Persist the result. A subsequent success replaces the
+            # previous failure under the same minute key.
             if pending_log is not None:
                 try:
                     log_data = write_log(
@@ -497,10 +501,14 @@ def run_instance(instance, initial_log, stop_event):
                     pending_log = None
                     pending_minute = None
                 except OSError:
-                    logging.exception("%s Could not write the log file", instance.prefix)
+                    logging.exception(
+                        "%s Could not write the log file", instance.prefix
+                    )
 
         except Exception:
-            logging.exception("%s Unexpected error in the instance worker", instance.prefix)
+            logging.exception(
+                "%s Unexpected error in the instance worker", instance.prefix
+            )
 
         stop_event.wait(POLL_INTERVAL)
 
